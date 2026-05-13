@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
 import time
@@ -10,20 +10,47 @@ import time
 class Track:
     track_id: str
     iff: str
-    alt: int
+    alt: float
     hdg: float
     spd: float
     nctr: str
     x_km: float
     y_km: float
     vector_len: float = 18.0
+    damaged: bool = False
+    damage_age: float = 0.0
+    descent_rate: float = 18.0
+
+
+@dataclass
+class Missile:
+    missile_id: str
+    target_id: str
+    x_km: float
+    y_km: float
+    hdg: float
+    launch_mode: str = "PPI 360"
+    spd: float = 1400.0
+    max_spd: float = 4300.0
+    accel: float = 700.0
+    burn_time: float = 7.5
+    drag: float = 70.0
+    max_turn_rate: float = 62.0
+    nav_constant: float = 4.0
+    seeker_limit: float = 65.0
+    proximity_radius: float = 3.8
+    age: float = 0.0
+    max_age: float = 38.0
+    last_los: float | None = None
+    guidance_lost: bool = False
+    trail: list = field(default_factory=list)
 
 
 class RadarSim:
     def __init__(self, root):
         self.root = root
-        self.root.title("Cold War CRT Radar Simulator - Enhanced FCS")
-        self.root.geometry("1180x780")
+        self.root.title("Cold War CRT Radar Simulator - Enhanced FCS / PN Missiles")
+        self.root.geometry("1200x780")
 
         self.canvas_w = 820
         self.canvas_h = 740
@@ -34,6 +61,8 @@ class RadarSim:
         self.range_steps_km = [50, 100, 150, 250, 400]
         self.max_range_km = 250
         self.sweep_angle = 0.0
+        # Unbounded sweep phase prevents sector modes from snapping when the 360° sweep wraps.
+        self.sweep_phase = 0.0
         self.sweep_speed_deg = 85.0
         self.running = True
         self.speed_scale = 35.0
@@ -43,8 +72,28 @@ class RadarSim:
         self.major_font_size = 12
         self.last_time = time.time()
         self.tracks = []
+        self.missiles = []
         self.locked_track_id = None
         self.last_lock_flash = 0.0
+        self.missile_counter = 0
+        self.missile_ammo = 8
+        self.max_missile_ammo = 8
+        self.missile_cooldown = 0.0
+        self.missile_reload_cooldown = 0.0
+        # 1980s-ish guided missile model for video/simulation purposes.
+        # Uses boosted flight, seeker limits, and proportional-navigation style lead pursuit.
+        self.missile_launch_speed_kmh = 1400.0
+        self.missile_max_speed_kmh = 4300.0
+        self.missile_accel_kmh_s = 700.0
+        self.missile_burn_time_s = 7.5
+        self.missile_drag_kmh_s = 70.0
+        self.missile_max_turn_rate_deg = 62.0
+        self.missile_nav_constant = 4.0
+        self.missile_seeker_limit_deg = 65.0
+        self.missile_proximity_radius_km = 3.8
+        self.missile_trail_points = 64
+        self.kills = 0
+        self.shots_fired = 0
 
         self.mode_var = tk.StringVar(value="PPI 360")
         self.fcs_state_var = tk.StringVar(value="STANDBY")
@@ -75,6 +124,9 @@ class RadarSim:
         }
 
         self.build_ui()
+        self.root.bind("<Return>", self.lock_nearest_track_event)
+        self.root.bind("g", lambda event=None: self.set_theme("green"))
+        self.root.bind("a", lambda event=None: self.set_theme("amber"))
         self.add_demo_tracks()
         self.animate()
 
@@ -86,10 +138,40 @@ class RadarSim:
         self.canvas = tk.Canvas(main, highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
+        self.canvas.bind("<Button-1>", self.select_track_with_mouse)
 
-        panel = ttk.Frame(main, width=310)
-        panel.pack(side="right", fill="y", padx=10, pady=10)
-        panel.pack_propagate(False)
+        panel_shell = ttk.Frame(main, width=330)
+        panel_shell.pack(side="right", fill="y", padx=10, pady=10)
+        panel_shell.pack_propagate(False)
+
+        panel_canvas = tk.Canvas(panel_shell, highlightthickness=0, borderwidth=0)
+        panel_scroll = ttk.Scrollbar(panel_shell, orient="vertical", command=panel_canvas.yview)
+        panel = ttk.Frame(panel_canvas)
+        panel_window = panel_canvas.create_window((0, 0), window=panel, anchor="nw")
+        panel_canvas.configure(yscrollcommand=panel_scroll.set)
+
+        def _update_scroll_region(event=None):
+            panel_canvas.configure(scrollregion=panel_canvas.bbox("all"))
+
+        def _fit_panel_width(event):
+            panel_canvas.itemconfigure(panel_window, width=event.width)
+
+        def _on_mousewheel(event):
+            delta = getattr(event, "delta", 0)
+            if delta:
+                panel_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            else:
+                direction = 1 if getattr(event, "num", None) == 5 else -1
+                panel_canvas.yview_scroll(direction, "units")
+
+        panel.bind("<Configure>", _update_scroll_region)
+        panel_canvas.bind("<Configure>", _fit_panel_width)
+        panel_canvas.bind("<Enter>", lambda event: panel_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        panel_canvas.bind("<Leave>", lambda event: panel_canvas.unbind_all("<MouseWheel>"))
+        panel_canvas.bind("<Button-4>", _on_mousewheel)
+        panel_canvas.bind("<Button-5>", _on_mousewheel)
+        panel_canvas.pack(side="left", fill="both", expand=True)
+        panel_scroll.pack(side="right", fill="y")
 
         ttk.Label(panel, text="Radar Mode").pack(anchor="w")
         modes = [
@@ -110,7 +192,12 @@ class RadarSim:
             values=modes,
             state="readonly",
             width=22,
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, 6))
+
+        theme_frame = ttk.LabelFrame(panel, text="CRT Theme")
+        theme_frame.pack(fill="x", pady=(0, 10))
+        ttk.Button(theme_frame, text="Green CRT   [G]", command=lambda: self.set_theme("green")).pack(side="left", expand=True, fill="x", padx=6, pady=6)
+        ttk.Button(theme_frame, text="Amber CRT   [A]", command=lambda: self.set_theme("amber")).pack(side="left", expand=True, fill="x", padx=6, pady=6)
 
         fcs_frame = ttk.LabelFrame(panel, text="FCS / Lock Control")
         fcs_frame.pack(fill="x", pady=(0, 10))
@@ -118,6 +205,8 @@ class RadarSim:
         ttk.Checkbutton(fcs_frame, text="Lead cue", variable=self.show_lead_cue).pack(anchor="w", padx=6, pady=2)
         ttk.Button(fcs_frame, text="Lock Nearest", command=self.lock_nearest_track).pack(fill="x", padx=6, pady=2)
         ttk.Button(fcs_frame, text="Lock Next", command=self.lock_next_track).pack(fill="x", padx=6, pady=2)
+        ttk.Button(fcs_frame, text="Fire Missile", command=self.fire_missile).pack(fill="x", padx=6, pady=2)
+        ttk.Button(fcs_frame, text="Reload Missiles", command=self.reload_missiles).pack(fill="x", padx=6, pady=2)
         ttk.Button(fcs_frame, text="Clear Lock", command=self.clear_lock).pack(fill="x", padx=6, pady=(2, 6))
 
         ttk.Label(panel, text="Track Setup").pack(anchor="w", pady=(0, 8))
@@ -157,12 +246,6 @@ class RadarSim:
         ttk.Button(range_frame, text="Range -", command=lambda: self.change_range(-1)).pack(side="left", expand=True, fill="x", padx=6, pady=6)
         ttk.Button(range_frame, text="Range +", command=lambda: self.change_range(1)).pack(side="left", expand=True, fill="x", padx=6, pady=6)
 
-        ttk.Label(panel, text="Theme").pack(anchor="w")
-        ttk.Button(panel, text="Green CRT", command=lambda: self.set_theme("green")).pack(fill="x", pady=2)
-        ttk.Button(panel, text="Amber CRT", command=lambda: self.set_theme("amber")).pack(fill="x", pady=2)
-
-        ttk.Separator(panel).pack(fill="x", pady=10)
-
         ttk.Label(panel, text="Track Label Size").pack(anchor="w")
         ttk.Button(panel, text="Smaller", command=lambda: self.change_track_font(-1)).pack(fill="x", pady=2)
         ttk.Button(panel, text="Bigger", command=lambda: self.change_track_font(1)).pack(fill="x", pady=2)
@@ -177,7 +260,11 @@ class RadarSim:
             "TWS = track-while-scan\n"
             "STT = single target track\n"
             "FCS = fire-control solution\n"
-            "ACM = close boresight lock"
+            "ACM = close boresight lock\n"
+            "Click a contact to lock it\n"
+            "Enter = lock nearest\n"
+            "A/G = amber/green CRT\n"
+            "Missiles use PN lead pursuit"
         )
         ttk.Label(panel, text=notes, justify="left").pack(anchor="w")
 
@@ -202,7 +289,13 @@ class RadarSim:
 
     def clear_tracks(self):
         self.tracks.clear()
+        self.missiles.clear()
         self.locked_track_id = None
+
+    def reload_missiles(self):
+        self.missile_ammo = self.max_missile_ammo
+        self.missile_reload_cooldown = 1.5
+        self.fcs_state_var.set("RELOADED")
 
     def toggle_running(self):
         self.running = not self.running
@@ -235,17 +328,134 @@ class RadarSim:
             print("Invalid track input.")
 
     def update_tracks(self, dt):
+        survivors = []
         for t in self.tracks:
-            distance_km = (t.spd / 3600.0) * dt * self.speed_scale
+            if t.damaged:
+                t.damage_age += dt
+                t.alt = max(0.0, float(t.alt) - t.descent_rate * dt)
+                t.spd = max(120.0, float(t.spd) - 22.0 * dt)
+                # A hit track keeps moving while descending, but no longer wraps back onto the scope.
+                drift_scale = 0.45
+            else:
+                drift_scale = 1.0
+
+            distance_km = (float(t.spd) / 3600.0) * dt * self.speed_scale * drift_scale
             rad = math.radians(t.hdg)
 
             t.x_km += math.sin(rad) * distance_km
             t.y_km += math.cos(rad) * distance_km
 
+            if t.damaged and t.alt <= 0.0:
+                if self.locked_track_id == t.track_id:
+                    self.locked_track_id = None
+                    self.fcs_state_var.set("STANDBY")
+                continue
+
             dist = math.hypot(t.x_km, t.y_km)
-            if dist > self.max_range_km * 1.08:
+            if not t.damaged and dist > self.max_range_km * 1.08:
                 t.x_km *= -0.85
                 t.y_km *= -0.85
+
+            survivors.append(t)
+
+        self.tracks = survivors
+
+    def find_track_by_id(self, track_id):
+        for t in self.tracks:
+            if t.track_id == track_id:
+                return t
+        return None
+
+    def update_missiles(self, dt):
+        self.missile_cooldown = max(0.0, self.missile_cooldown - dt)
+        self.missile_reload_cooldown = max(0.0, self.missile_reload_cooldown - dt)
+
+        survivors = []
+        for m in self.missiles:
+            m.age += dt
+            prev_x, prev_y = m.x_km, m.y_km
+            m.trail.append((m.x_km, m.y_km))
+            if len(m.trail) > self.missile_trail_points:
+                m.trail = m.trail[-self.missile_trail_points:]
+
+            # Boost-sustain behavior: fast burn first, then slow decay. This makes
+            # the weapon visibly accelerate instead of moving as a constant-speed dot.
+            if m.age <= m.burn_time:
+                m.spd = min(m.max_spd, m.spd + m.accel * dt)
+            else:
+                m.spd = max(850.0, m.spd - m.drag * dt)
+
+            target = self.find_track_by_id(m.target_id)
+            target_in_launch_view = bool(target and self.track_is_visible_for_mode(target, m.launch_mode))
+
+            if target_in_launch_view:
+                rx = target.x_km - m.x_km
+                ry = target.y_km - m.y_km
+                rng = max(0.001, math.hypot(rx, ry))
+                los = math.degrees(math.atan2(rx, ry)) % 360
+                seeker_error = self.signed_angle(los, m.hdg)
+
+                # If the target moves outside the seeker cone, the missile coasts
+                # unguided. It can reacquire if the nose comes back near the target.
+                if abs(seeker_error) <= m.seeker_limit:
+                    m.guidance_lost = False
+                    if m.last_los is None:
+                        m.last_los = los
+
+                    los_rate = self.signed_angle(los, m.last_los) / max(dt, 0.001)
+                    m.last_los = los
+
+                    mvx, mvy = self.velocity_vector_display(m.hdg, m.spd)
+                    tvx, tvy = self.target_velocity_display(target)
+                    rvx = tvx - mvx
+                    rvy = tvy - mvy
+                    closing = -((rx * rvx + ry * rvy) / rng)
+                    missile_speed_display = max(0.001, math.hypot(mvx, mvy))
+
+                    # Proportional navigation gives the curved, leading intercept path
+                    # you would expect from late Cold War radar-guided missiles.
+                    pn_rate = m.nav_constant * max(0.25, closing / missile_speed_display) * los_rate
+
+                    # Blend in explicit lead-pursuit so high-aspect crossing targets
+                    # do not collapse into pure-pursuit tail chasing.
+                    lead = self.intercept_solution(m.x_km, m.y_km, target, max(m.spd, m.max_spd * 0.82))
+                    lead_error = self.signed_angle(lead["bearing"], m.hdg)
+                    lead_rate = lead_error / 0.85
+
+                    commanded_rate = 0.72 * pn_rate + 0.92 * lead_rate
+                    speed_factor = 0.45 + 0.55 * min(1.0, m.spd / max(1.0, m.max_spd))
+                    turn_limit = m.max_turn_rate * speed_factor
+                    turn_rate = max(-turn_limit, min(turn_limit, commanded_rate))
+                    m.hdg = (m.hdg + turn_rate * dt) % 360
+                else:
+                    m.guidance_lost = True
+
+            rad = math.radians(m.hdg)
+            distance_km = (m.spd / 3600.0) * dt * self.speed_scale
+            m.x_km += math.sin(rad) * distance_km
+            m.y_km += math.cos(rad) * distance_km
+
+            if target_in_launch_view and not m.guidance_lost:
+                miss_distance = self.segment_point_distance(prev_x, prev_y, m.x_km, m.y_km, target.x_km, target.y_km)
+                direct_distance = math.hypot(target.x_km - m.x_km, target.y_km - m.y_km)
+                if min(miss_distance, direct_distance) <= m.proximity_radius:
+                    self.damage_track(target)
+                    continue
+
+            if m.age > m.max_age or math.hypot(m.x_km, m.y_km) > self.max_range_km * 1.45:
+                continue
+
+            survivors.append(m)
+
+        self.missiles = survivors
+
+    def damage_track(self, target):
+        if not target.damaged:
+            target.damaged = True
+            target.damage_age = 0.0
+            target.descent_rate = max(10.0, min(28.0, float(target.alt) / 7.0))
+            self.kills += 1
+        self.fcs_state_var.set("HIT")
 
     # ---------------------------- Math helpers ----------------------------
     def signed_angle(self, angle, center=0):
@@ -270,9 +480,25 @@ class RadarSim:
         return math.hypot(x - self.cx, y - self.cy) <= self.radius
 
     def get_sector_sweep_bearing(self, width=120):
+        """Smooth bidirectional sector sweep centered on 000°.
+
+        Uses an unbounded sweep phase, not the wrapped 360° display angle.
+        That avoids the visible jump that happened after the first global loop.
+        Cosine easing slows the beam gently at the left/right edges.
+        """
         half = width / 2
-        p = self.sweep_angle % (width * 2)
-        offset = -half + p if p <= width else half - (p - width)
+        cycle = max(1.0, width * 2.0)
+        p = (self.sweep_phase % cycle) / cycle
+
+        if p < 0.5:
+            u = p * 2.0
+            eased = 0.5 - 0.5 * math.cos(math.pi * u)
+            offset = -half + eased * width
+        else:
+            u = (p - 0.5) * 2.0
+            eased = 0.5 - 0.5 * math.cos(math.pi * u)
+            offset = half - eased * width
+
         return offset % 360
 
     def track_velocity_kmh(self, t):
@@ -295,26 +521,90 @@ class RadarSim:
             return "COLD"
         return "FLANK"
 
+    def velocity_vector_display(self, hdg, spd_kmh):
+        """Return velocity in displayed km per real second.
+
+        Track and missile motion in this simulator is time-compressed by
+        self.speed_scale, so the same scaled units are used for intercept math.
+        """
+        rad = math.radians(hdg)
+        speed = (float(spd_kmh) / 3600.0) * self.speed_scale
+        return math.sin(rad) * speed, math.cos(rad) * speed
+
+    def target_velocity_display(self, t):
+        return self.velocity_vector_display(t.hdg, t.spd)
+
+    def segment_point_distance(self, ax, ay, bx, by, px, py):
+        abx = bx - ax
+        aby = by - ay
+        apx = px - ax
+        apy = py - ay
+        denom = abx * abx + aby * aby
+        if denom <= 1e-9:
+            return math.hypot(px - ax, py - ay)
+        u = max(0.0, min(1.0, (apx * abx + apy * aby) / denom))
+        cx = ax + abx * u
+        cy = ay + aby * u
+        return math.hypot(px - cx, py - cy)
+
+    def intercept_solution(self, shooter_x, shooter_y, target, missile_speed_kmh=None):
+        """Predict the target intercept point for a constant-speed first guess."""
+        missile_speed_kmh = missile_speed_kmh or self.missile_max_speed_kmh
+        vm = max(0.001, (float(missile_speed_kmh) / 3600.0) * self.speed_scale)
+        tvx, tvy = self.target_velocity_display(target)
+        rx = target.x_km - shooter_x
+        ry = target.y_km - shooter_y
+
+        a = tvx * tvx + tvy * tvy - vm * vm
+        b = 2.0 * (rx * tvx + ry * tvy)
+        c = rx * rx + ry * ry
+        t_hit = None
+
+        if abs(a) < 1e-9:
+            if abs(b) > 1e-9:
+                candidate = -c / b
+                if candidate > 0:
+                    t_hit = candidate
+        else:
+            disc = b * b - 4.0 * a * c
+            if disc >= 0:
+                root = math.sqrt(disc)
+                candidates = [(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+                positives = [v for v in candidates if v > 0]
+                if positives:
+                    t_hit = min(positives)
+
+        if t_hit is None:
+            t_hit = math.sqrt(c) / vm
+
+        t_hit = max(0.2, min(60.0, t_hit))
+        lead_x = target.x_km + tvx * t_hit
+        lead_y = target.y_km + tvy * t_hit
+        lead_brg = math.degrees(math.atan2(lead_x - shooter_x, lead_y - shooter_y)) % 360
+        lead_rng = math.hypot(lead_x - shooter_x, lead_y - shooter_y)
+        return {
+            "lead_seconds": t_hit,
+            "lead_x": lead_x,
+            "lead_y": lead_y,
+            "bearing": lead_brg,
+            "range": lead_rng,
+        }
+
     def fcs_solution(self, t):
         rng = self.range_of_track(t)
         closure = self.closure_rate(t)
         brg = self.bearing_of_track(t)
-        vx, vy = self.track_velocity_kmh(t)
-        lead_seconds = min(45.0, max(5.0, rng / max(8.0, abs(closure) / 12.0)))
-        future_x = t.x_km + vx * lead_seconds / 3600.0
-        future_y = t.y_km + vy * lead_seconds / 3600.0
-        lead_brg = math.degrees(math.atan2(future_x, future_y)) % 360
-        lead_rng = math.hypot(future_x, future_y)
+        lead = self.intercept_solution(0.0, 0.0, t, self.missile_max_speed_kmh * 0.88)
         return {
             "range": rng,
             "bearing": brg,
             "closure": closure,
             "aspect": self.aspect_text(t),
-            "lead_seconds": lead_seconds,
-            "lead_x": future_x,
-            "lead_y": future_y,
-            "lead_bearing": lead_brg,
-            "lead_range": lead_rng,
+            "lead_seconds": lead["lead_seconds"],
+            "lead_x": lead["lead_x"],
+            "lead_y": lead["lead_y"],
+            "lead_bearing": lead["bearing"],
+            "lead_range": lead["range"],
         }
 
     # ---------------------------- Lock/FCS helpers ----------------------------
@@ -341,6 +631,48 @@ class RadarSim:
             return abs(self.signed_angle(brg, 0)) <= 70
         return True
 
+    def screen_pos_for_track(self, t, mode=None):
+        mode = mode or self.mode_var.get()
+        if mode == "B-SCOPE":
+            p = self.bscope_coord(t.x_km, t.y_km)
+            if not p:
+                return None
+            return p[0], p[1]
+        if mode == "E-SCOPE":
+            rng = self.range_of_track(t)
+            if rng > self.max_range_km:
+                return None
+            left, top, right, bottom = self.escope_bounds()
+            max_alt = max(300.0, max([float(tr.alt) for tr in self.tracks], default=300.0))
+            x = left + rng / self.max_range_km * (right - left)
+            y = bottom - min(float(t.alt), max_alt) / max_alt * (bottom - top)
+            return x, y
+        x, y = self.km_to_px_ppi(t.x_km, t.y_km)
+        if not self.px_in_ppi(x, y):
+            return None
+        return x, y
+
+    def select_track_with_mouse(self, event):
+        mode = self.mode_var.get()
+        candidates = []
+        for t in self.tracks:
+            if not self.track_is_visible_for_mode(t, mode):
+                continue
+            pos = self.screen_pos_for_track(t, mode)
+            if not pos:
+                continue
+            x, y = pos
+            d = math.hypot(event.x - x, event.y - y)
+            candidates.append((d, t))
+
+        if not candidates:
+            return
+
+        distance_px, target = min(candidates, key=lambda item: item[0])
+        if distance_px <= 30:
+            self.locked_track_id = target.track_id
+            self.fcs_state_var.set("LOCK")
+
     def lock_nearest_track(self):
         candidates = [t for t in self.tracks if self.track_is_visible_for_mode(t)]
         if not candidates:
@@ -350,6 +682,9 @@ class RadarSim:
         target = min(candidates, key=self.range_of_track)
         self.locked_track_id = target.track_id
         self.fcs_state_var.set("LOCK")
+
+    def lock_nearest_track_event(self, event=None):
+        self.lock_nearest_track()
 
     def lock_next_track(self):
         candidates = sorted([t for t in self.tracks if self.track_is_visible_for_mode(t)], key=lambda tr: tr.track_id)
@@ -364,6 +699,60 @@ class RadarSim:
             self.locked_track_id = candidates[(idx + 1) % len(candidates)].track_id
         self.fcs_state_var.set("LOCK")
 
+    def fire_missile(self, event=None):
+        target = self.get_locked_track()
+        if not self.fcs_master_arm.get():
+            self.fcs_state_var.set("SAFE")
+            return
+        if not target:
+            self.fcs_state_var.set("NO LOCK")
+            return
+        if target.damaged:
+            self.fcs_state_var.set("DAMAGED")
+            return
+        if not self.track_is_visible_for_mode(target):
+            self.locked_track_id = None
+            self.fcs_state_var.set("OUT OF VIEW")
+            return
+        if self.missile_ammo <= 0:
+            self.fcs_state_var.set("NO MSL")
+            return
+        if self.missile_cooldown > 0.0:
+            self.fcs_state_var.set("WAIT")
+            return
+
+        sol = self.fcs_solution(target)
+        # Simple arcade launch envelope: within displayed radar range and not too close.
+        if sol["range"] > min(self.max_range_km, 220) or sol["range"] < 6:
+            self.fcs_state_var.set("NO SHOT")
+            return
+
+        self.missile_counter += 1
+        missile = Missile(
+            missile_id=f"M{self.missile_counter:02d}",
+            target_id=target.track_id,
+            x_km=0.0,
+            y_km=0.0,
+            hdg=sol["lead_bearing"],
+            launch_mode=self.mode_var.get(),
+            spd=self.missile_launch_speed_kmh,
+            max_spd=self.missile_max_speed_kmh,
+            accel=self.missile_accel_kmh_s,
+            burn_time=self.missile_burn_time_s,
+            drag=self.missile_drag_kmh_s,
+            max_turn_rate=self.missile_max_turn_rate_deg,
+            nav_constant=self.missile_nav_constant,
+            seeker_limit=self.missile_seeker_limit_deg,
+            proximity_radius=self.missile_proximity_radius_km,
+        )
+        missile.last_los = self.bearing_of_track(target)
+        missile.trail.append((missile.x_km, missile.y_km))
+        self.missiles.append(missile)
+        self.missile_ammo -= 1
+        self.shots_fired += 1
+        self.missile_cooldown = 0.85
+        self.fcs_state_var.set("MISSILE")
+
     def clear_lock(self):
         self.locked_track_id = None
         self.fcs_state_var.set("STANDBY")
@@ -372,9 +761,17 @@ class RadarSim:
         mode = self.mode_var.get()
         lock_required = mode in ("STT LOCK", "FCS", "ACM BORESIGHT")
         locked = self.get_locked_track()
-        if lock_required and (not locked or not self.track_is_visible_for_mode(locked, mode)):
+
+        # Never carry a lock into a mode where that track is outside the visible radar volume.
+        # This fixes sector/ACM modes being able to fire at off-screen contacts.
+        if locked and not self.track_is_visible_for_mode(locked, mode):
+            self.locked_track_id = None
+            locked = None
+            self.fcs_state_var.set("OUT OF VIEW")
+
+        if lock_required and not locked:
             self.lock_nearest_track()
-        elif not lock_required and self.fcs_state_var.get() == "NO TRACK":
+        elif not lock_required and self.fcs_state_var.get() in ("NO TRACK", "OUT OF VIEW"):
             self.fcs_state_var.set("STANDBY")
 
     # ---------------------------- Drawing helpers ----------------------------
@@ -566,14 +963,15 @@ class RadarSim:
     def draw_track_label(self, x, y, t, color, compact=False):
         if compact:
             sol = self.fcs_solution(t)
-            label = f"{t.track_id}  {int(sol['bearing']):03d}°/{int(sol['range']):03d}km  {t.iff}"
+            state = " DMG" if t.damaged else ""
+            label = f"{t.track_id}{state}  {int(sol['bearing']):03d}°/{int(sol['range']):03d}km  {t.iff}"
         else:
             sol = self.fcs_solution(t)
             label = (
-                f"TRK {t.track_id}\n"
+                f"TRK {t.track_id}{'  DMG' if t.damaged else ''}\n"
                 f"IFF {t.iff}\n"
                 f"BRG {int(sol['bearing']):03d}° RNG {int(sol['range']):03d} km\n"
-                f"ALT {t.alt:03d}  HDG {int(t.hdg):03d}°\n"
+                f"ALT {int(t.alt):03d}  HDG {int(t.hdg):03d}°\n"
                 f"SPD {int(t.spd):03d}  NCTR {t.nctr}"
             )
 
@@ -620,7 +1018,10 @@ class RadarSim:
 
             sweep_dist = self.angle_difference(active_sweep, brg)
             is_locked = locked is t
-            if is_locked:
+            if t.damaged:
+                fill = col["warn"]
+                r = 5
+            elif is_locked:
                 fill = col["bright"]
                 r = 6
             elif dim_others:
@@ -643,8 +1044,10 @@ class RadarSim:
             vy = y - math.cos(hrad) * t.vector_len
             self.canvas.create_line(x, y, vx, vy, fill=fill, width=2 if is_locked else 1)
 
-            if labels and not raw and self.show_track_labels.get() and (not dim_others or is_locked):
-                self.draw_track_label(x, y, t, col["bright"] if is_locked else col["text"], compact=False)
+            if t.damaged:
+                self.canvas.create_line(x - 7, y + 9, x, y + 18, x + 7, y + 9, fill=col["warn"], width=2)
+            if labels and not raw and self.show_track_labels.get() and (not dim_others or is_locked or t.damaged):
+                self.draw_track_label(x, y, t, col["warn"] if t.damaged else col["bright"] if is_locked else col["text"], compact=False)
 
     def draw_ppi_mode(self, sector=False, raw=False, sector_width=120, title=None, labels=True, dim_others=False):
         self.draw_ppi_grid(sector=sector, sector_width=sector_width, title=title)
@@ -721,8 +1124,8 @@ class RadarSim:
                 continue
             x, y, rel, rng = p
             is_locked = locked is t
-            fill = col["bright"] if is_locked else col["text"]
-            r = 5 if is_locked else 4
+            fill = col["warn"] if t.damaged else col["bright"] if is_locked else col["text"]
+            r = 5 if is_locked or t.damaged else 4
             self.draw_target_symbol(x, y, r, fill, locked=is_locked)
 
             hrad = math.radians(t.hdg)
@@ -733,7 +1136,7 @@ class RadarSim:
                 fx, fy, _, _ = fp
                 self.canvas.create_line(x, y, fx, fy, fill=fill, width=1)
             if self.show_track_labels.get():
-                self.draw_track_label(x, y, t, col["bright"] if is_locked else col["text"], compact=False)
+                self.draw_track_label(x, y, t, col["warn"] if t.damaged else col["bright"] if is_locked else col["text"], compact=False)
 
     def draw_bscope_mode(self):
         self.draw_bscope_grid()
@@ -751,7 +1154,7 @@ class RadarSim:
     def draw_escope_mode(self):
         col = self.colors[self.theme]
         left, top, right, bottom = self.escope_bounds()
-        max_alt = max(300, max([t.alt for t in self.tracks], default=300))
+        max_alt = max(300.0, max([float(t.alt) for t in self.tracks], default=300.0))
 
         self.canvas.create_rectangle(left, top, right, bottom, outline=col["grid"], width=2)
         self.crt_text((left + right) / 2, top - 24, "E-SCOPE / RANGE-ALTITUDE", fill=col["bright"], font=("Consolas", 13, "bold"), bg=True)
@@ -773,8 +1176,8 @@ class RadarSim:
             if rng > self.max_range_km:
                 continue
             x = left + rng / self.max_range_km * (right - left)
-            y = bottom - min(t.alt, max_alt) / max_alt * (bottom - top)
-            fill = col["bright"] if locked is t else col["text"]
+            y = bottom - min(float(t.alt), max_alt) / max_alt * (bottom - top)
+            fill = col["warn"] if t.damaged else col["bright"] if locked is t else col["text"]
             self.draw_target_symbol(x, y, 5, fill, locked=locked is t)
             if self.show_track_labels.get():
                 self.draw_track_label(x, y, t, fill, compact=True)
@@ -821,9 +1224,11 @@ class RadarSim:
         self.draw_ppi_sweep(sector=True, sector_width=36)
         self.draw_ppi_tracks(sector=True, sector_width=36, labels=True, dim_others=True)
         s = 46
-        self.canvas.create_rectangle(self.cx - s, self.cy - self.radius + 78, self.cx + s, self.cy - self.radius + 162, outline=col["bright"], width=2)
-        self.canvas.create_line(self.cx, self.cy - self.radius + 60, self.cx, self.cy - self.radius + 180, fill=col["bright"], width=2)
-        self.canvas.create_line(self.cx - 60, self.cy - self.radius + 120, self.cx + 60, self.cy - self.radius + 120, fill=col["bright"], width=2)
+        # Lowered the ACM boresight reticle so it no longer crowds the top title/angle labels.
+        acm_y = self.cy - self.radius + 176
+        self.canvas.create_rectangle(self.cx - s, acm_y - 42, self.cx + s, acm_y + 42, outline=col["bright"], width=2)
+        self.canvas.create_line(self.cx, acm_y - 62, self.cx, acm_y + 62, fill=col["bright"], width=2)
+        self.canvas.create_line(self.cx - 60, acm_y, self.cx + 60, acm_y, fill=col["bright"], width=2)
         self.crt_text(self.cx, self.canvas_h - 48, "AUTO-ACQUIRE: ±18° / 90 km", fill=col["text"], font=("Consolas", 11, "bold"), bg=True)
         self.draw_fcs_overlay(full_panel=False)
 
@@ -846,29 +1251,103 @@ class RadarSim:
             self.canvas.create_line(tx, ty, lx, ly, fill=col["warn"], width=1)
             self.crt_text(lx + 12, ly + 10, "LEAD", fill=col["warn"], font=("Consolas", 9, "bold"), anchor="nw", bg=True)
 
-        ready = self.fcs_master_arm.get() and sol["range"] < 120 and abs(sol["closure"]) > 20
+        ready = (
+            self.fcs_master_arm.get()
+            and self.missile_ammo > 0
+            and self.missile_cooldown <= 0.0
+            and 6 <= sol["range"] <= min(self.max_range_km, 220)
+        )
         cue = "SHOOT" if ready else "HOLD"
         cue_fill = col["warn"] if ready else col["text"]
 
-        box_x = self.canvas_w - 250 if full_panel else 18
-        box_y = 110 if full_panel else self.canvas_h - 142
-        box_w = 226
-        box_h = 126
+        box_x = self.canvas_w - 270 if full_panel else 18
+        box_y = 110 if full_panel else self.canvas_h - 166
+        box_w = 248
+        box_h = 166
         self.canvas.create_rectangle(box_x, box_y, box_x + box_w, box_y + box_h, outline=col["grid"], fill=col["bg"], width=2)
         lines = [
             f"FCS {master}  {cue}",
             f"LOCK TRK {target.track_id}  {target.iff}",
             f"BRG {int(sol['bearing']):03d}°   RNG {sol['range']:06.1f} km",
             f"HDG {int(target.hdg):03d}°   SPD {int(target.spd):03d}",
-            f"ALT {target.alt:03d}    ASP {sol['aspect']}",
+            f"ALT {int(target.alt):03d}    ASP {sol['aspect']}",
             f"CLOS {sol['closure']:+06.1f}  LEAD {sol['lead_seconds']:04.1f}s",
+            f"MSL {self.missile_ammo:02d}/{self.max_missile_ammo:02d}  CD {self.missile_cooldown:03.1f}s",
+            f"GUIDE PN-{self.missile_nav_constant:.1f}  MAX {int(self.missile_max_speed_kmh)}",
             f"NCTR {target.nctr}",
         ]
         for i, line in enumerate(lines):
             fill = cue_fill if i == 0 else col["text"]
             self.crt_text(box_x + 10, box_y + 10 + i * 16, line, fill=fill, font=("Consolas", 10, "bold"), anchor="nw", bg=False)
 
-        self.crt_text(self.cx, self.cy + self.radius + 34, f"STEER {int(sol['lead_bearing']):03d}°  TARGET {int(sol['bearing']):03d}°", fill=col["bright"], font=("Consolas", 12, "bold"), bg=True)
+        fire_hint = "READY" if ready else self.fcs_state_var.get()
+        self.crt_text(
+            self.cx,
+            self.cy + self.radius + 34,
+            f"STEER {int(sol['lead_bearing']):03d}°  TARGET {int(sol['bearing']):03d}°   {fire_hint}",
+            fill=col["bright"] if ready else col["text"],
+            font=("Consolas", 12, "bold"),
+            bg=True,
+        )
+
+    # ---------------------------- Missile / effects drawing ----------------------------
+    def draw_missiles_ppi(self):
+        col = self.colors[self.theme]
+        for m in self.missiles:
+            trail_points = []
+            for px_km, py_km in m.trail:
+                px, py = self.km_to_px_ppi(px_km, py_km)
+                if self.px_in_ppi(px, py):
+                    trail_points.append((px, py))
+            for i in range(1, len(trail_points)):
+                self.canvas.create_line(
+                    trail_points[i - 1][0], trail_points[i - 1][1],
+                    trail_points[i][0], trail_points[i][1],
+                    fill=col["dim"], width=1,
+                )
+
+            x, y = self.km_to_px_ppi(m.x_km, m.y_km)
+            if not self.px_in_ppi(x, y):
+                continue
+            rad = math.radians(m.hdg)
+            nose_x = x + math.sin(rad) * 10
+            nose_y = y - math.cos(rad) * 10
+            tail_x = x - math.sin(rad) * 7
+            tail_y = y + math.cos(rad) * 7
+            self.canvas.create_line(tail_x, tail_y, nose_x, nose_y, fill=col["warn"], width=3)
+            self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=col["bright"], width=1)
+            self.crt_text(x + 9, y + 6, m.missile_id, fill=col["warn"], font=("Consolas", 8, "bold"), anchor="nw", bg=True)
+
+    def draw_missiles_bscope(self):
+        col = self.colors[self.theme]
+        for m in self.missiles:
+            p = self.bscope_coord(m.x_km, m.y_km)
+            if not p:
+                continue
+            x, y, _, _ = p
+            self.canvas.create_rectangle(x - 4, y - 4, x + 4, y + 4, outline=col["warn"], width=2)
+            self.crt_text(x + 8, y + 6, m.missile_id, fill=col["warn"], font=("Consolas", 8, "bold"), anchor="nw", bg=True)
+
+    def draw_missiles_escope(self):
+        col = self.colors[self.theme]
+        left, top, right, bottom = self.escope_bounds()
+        for m in self.missiles:
+            rng = math.hypot(m.x_km, m.y_km)
+            if rng > self.max_range_km:
+                continue
+            x = left + rng / self.max_range_km * (right - left)
+            # Missiles are shown as a low-altitude weapon trace on E-scope.
+            y = bottom - 0.08 * (bottom - top)
+            self.canvas.create_rectangle(x - 4, y - 4, x + 4, y + 4, outline=col["warn"], width=2)
+            self.crt_text(x + 8, y, m.missile_id, fill=col["warn"], font=("Consolas", 8, "bold"), anchor="w", bg=True)
+
+    def draw_weapon_overlays(self, mode):
+        if mode in ("B-SCOPE",):
+            self.draw_missiles_bscope()
+        elif mode in ("E-SCOPE",):
+            self.draw_missiles_escope()
+        else:
+            self.draw_missiles_ppi()
 
     # ---------------------------- Global overlays ----------------------------
     def draw_scanlines(self):
@@ -893,13 +1372,23 @@ class RadarSim:
         locked = self.get_locked_track()
         lock_text = locked.track_id if locked else "----"
         arm_text = "ARM" if self.fcs_master_arm.get() else "SAFE"
+        if mode in ("SECTOR 120", "RWS"):
+            sweep_readout = int(self.get_sector_sweep_bearing(120))
+        elif mode == "B-SCOPE":
+            sweep_readout = int(self.get_sector_sweep_bearing(140))
+        elif mode == "ACM BORESIGHT":
+            sweep_readout = int(self.get_sector_sweep_bearing(36))
+        else:
+            sweep_readout = int(self.sweep_angle)
         text = (
             f"{mode} MODE{flicker}\n"
             f"RANGE {self.max_range_km:03d} KM\n"
-            f"SWEEP {int(self.sweep_angle):03d}°\n"
+            f"SWEEP {sweep_readout:03d}°\n"
             f"TRACKS {len(self.tracks):02d}\n"
             f"LOCK {lock_text}\n"
-            f"FCS {arm_text}\n"
+            f"FCS {arm_text}  {self.fcs_state_var.get()}\n"
+            f"MSL {self.missile_ammo:02d}  AIR {len(self.missiles):02d}\n"
+            f"HITS {self.kills:02d}/{self.shots_fired:02d}\n"
             f"TIME {time.strftime('%H:%M:%S')}"
         )
         self.crt_text(18, 18, text, fill=col["text"], font=("Consolas", 11, "bold"), anchor="nw", bg=True, pad=4, justify="left")
@@ -933,8 +1422,10 @@ class RadarSim:
         self.last_time = now
 
         if self.running:
-            self.sweep_angle = (self.sweep_angle + self.sweep_speed_deg * dt) % 360
+            self.sweep_phase += self.sweep_speed_deg * dt
+            self.sweep_angle = self.sweep_phase % 360
             self.update_tracks(dt)
+            self.update_missiles(dt)
 
         self.auto_acquire_for_mode()
 
@@ -967,6 +1458,7 @@ class RadarSim:
         elif mode == "RAW CRT":
             self.draw_ppi_mode(sector=False, raw=True, title="RAW CRT", labels=False)
 
+        self.draw_weapon_overlays(mode)
         self.draw_range_ladder()
         self.draw_status_text()
         self.draw_vignette()
